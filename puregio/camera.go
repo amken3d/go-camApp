@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"image"
-	"image/draw"
-	"image/jpeg"
 	"log"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -50,6 +48,11 @@ type CameraInstance struct {
 	TextureOp          paint.ImageOp
 	TextureUpdated     int32 // Use atomic for thread-safe flag
 	LastFrameTime      time.Time
+	// FPS tracking
+	FPS           int32
+	FrameCount    uint64
+	LastFPSUpdate time.Time
+	FPSMutex      sync.Mutex
 }
 
 type CameraApp struct {
@@ -69,6 +72,12 @@ type CameraApp struct {
 	LastRenderTime time.Time
 	FrameCounter   uint64
 	Window         *app.Window
+
+	// App rendering FPS
+	AppFPS           int32
+	AppFrameCount    uint64
+	AppLastFPSUpdate time.Time
+	AppFPSMutex      sync.Mutex
 }
 
 var cameraApp CameraApp
@@ -103,6 +112,8 @@ func runGioWindow() {
 		defer ticker.Stop()
 
 		for range ticker.C {
+			updateCameraFramesFromProcessed()
+
 			if cameraApp.ShowCamera && cameraApp.SelectedCam < len(cameraApp.Cameras) {
 				camera := &cameraApp.Cameras[cameraApp.SelectedCam]
 				if atomic.LoadInt32(&camera.TextureUpdated) == 1 {
@@ -118,6 +129,9 @@ func runGioWindow() {
 			return
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
+			// Track app rendering FPS
+			atomic.AddUint64(&cameraApp.AppFrameCount, 1)
+			updateAppFPS()
 
 			// Handle UI interactions
 			handleUIEvents(gtx)
@@ -132,8 +146,8 @@ func runGioWindow() {
 			if atomic.LoadUint64(&cameraApp.FrameCounter)%60 == 0 {
 				now := time.Now()
 				if !cameraApp.LastRenderTime.IsZero() {
-					fps := 60.0 / now.Sub(cameraApp.LastRenderTime).Seconds()
-					log.Printf("Render FPS: %.1f", fps)
+					//fps := 60.0 / now.Sub(cameraApp.LastRenderTime).Seconds()
+
 				}
 				cameraApp.LastRenderTime = now
 			}
@@ -142,10 +156,6 @@ func runGioWindow() {
 }
 
 func handleUIEvents(gtx layout.Context) {
-	// Handle increment button
-	if cameraApp.IncrementBtn.Clicked(gtx) {
-		cameraApp.Count++
-	}
 
 	// Handle camera display toggle
 	if cameraApp.ToggleCameraBtn.Clicked(gtx) {
@@ -188,13 +198,8 @@ func renderControlPanel(gtx layout.Context) layout.Dimensions {
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return material.Body2(cameraApp.Theme, cameraApp.StatusText).Layout(gtx)
 			}),
-
-			layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
-
-			// Counter button
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return material.Button(cameraApp.Theme, &cameraApp.IncrementBtn,
-					fmt.Sprintf("Count: %d", cameraApp.Count)).Layout(gtx)
+				return renderAppInfo(gtx)
 			}),
 
 			layout.Rigid(layout.Spacer{Height: unit.Dp(15)}.Layout),
@@ -242,7 +247,7 @@ func renderControlPanel(gtx layout.Context) layout.Dimensions {
 
 					// Selected camera info
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return renderCameraInfo(gtx)
+						return renderCameraInfo(gtx, &cameraApp.Cameras[cameraApp.SelectedCam])
 					}),
 				)
 			}),
@@ -281,38 +286,29 @@ func renderCameraButtons(gtx layout.Context) layout.Dimensions {
 	}.Layout(gtx, children...)
 }
 
-func renderCameraInfo(gtx layout.Context) layout.Dimensions {
-	if cameraApp.SelectedCam >= len(cameraApp.Cameras) {
-		return layout.Dimensions{}
-	}
-
-	camera := &cameraApp.Cameras[cameraApp.SelectedCam]
-
-	return layout.Flex{
-		Axis: layout.Vertical,
-	}.Layout(gtx,
+func renderCameraInfo(gtx layout.Context, camera *CameraInstance) layout.Dimensions {
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return material.Caption(cameraApp.Theme, fmt.Sprintf("Current: %s", camera.Info.Name)).Layout(gtx)
+			return material.Caption(cameraApp.Theme, fmt.Sprintf("Camera: %s", camera.Info.Name)).Layout(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return material.Caption(cameraApp.Theme, fmt.Sprintf("Resolution: %dx%d", camera.Width, camera.Height)).Layout(gtx)
+			fps := atomic.LoadInt32(&camera.FPS)
+			return material.Caption(cameraApp.Theme, fmt.Sprintf("FPS: %d", fps)).Layout(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			status := "Inactive"
-			if camera.Active {
-				status = "Active"
+			droppedFrames := atomic.LoadUint64(&camera.DroppedFrames)
+			return material.Caption(cameraApp.Theme, fmt.Sprintf("Dropped: %d", droppedFrames)).Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			if !camera.LastFrameTime.IsZero() {
+				timeSince := time.Since(camera.LastFrameTime)
+				return material.Caption(cameraApp.Theme, fmt.Sprintf("Last frame: %v ago", timeSince.Truncate(time.Millisecond))).Layout(gtx)
 			}
-			return material.Caption(cameraApp.Theme, fmt.Sprintf("Status: %s", status)).Layout(gtx)
+			return material.Caption(cameraApp.Theme, "No frames yet").Layout(gtx)
 		}),
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return material.Caption(cameraApp.Theme, fmt.Sprintf("Dropped: %d", atomic.LoadUint64(&camera.DroppedFrames))).Layout(gtx)
-		}),
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			camera.FrameMutex.RLock()
-			hasFrame := camera.CurrentFrame != nil
-			camera.FrameMutex.RUnlock()
-			return material.Caption(cameraApp.Theme, fmt.Sprintf("Frame: %v", hasFrame)).Layout(gtx)
-		}),
+		// layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		// 	return material.Caption(cameraApp.Theme, fmt.Sprintf("Dropped: %d", droppedFrames)).Layout(gtx)
+		// }),
 	)
 }
 
@@ -403,10 +399,12 @@ func renderPlaceholder(gtx layout.Context, message string) layout.Dimensions {
 	})
 }
 
+// Enhanced findCameraDevices function with Raspberry Pi support
 func findCameraDevices() ([]CameraInfo, error) {
 	log.Println("Searching for camera devices...")
 	var cameras []CameraInfo
 
+	// First, look for standard V4L2 video devices
 	matches, err := filepath.Glob("/dev/video*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to find video devices: %w", err)
@@ -444,11 +442,72 @@ func findCameraDevices() ([]CameraInfo, error) {
 		dev.Close()
 	}
 
+	// Check for Raspberry Pi cameras using rpicam-vid
+	rpiCameras, err := findRaspberryPiCameras()
+	if err != nil {
+		log.Printf("Warning: Failed to detect Raspberry Pi cameras: %v", err)
+	} else {
+		// Add Raspberry Pi cameras to the list with higher indices
+		nextIndex := len(cameras)
+		for i, rpiCamera := range rpiCameras {
+			cameras = append(cameras, CameraInfo{
+				Path:  fmt.Sprintf("rpicam:%d", i), // Special path format for RPi cameras
+				Name:  rpiCamera,
+				Index: nextIndex + i,
+			})
+		}
+	}
+
 	sort.Slice(cameras, func(i, j int) bool {
 		return cameras[i].Index < cameras[j].Index
 	})
 
 	log.Printf("Camera discovery complete. Found %d cameras", len(cameras))
+	return cameras, nil
+}
+
+// findRaspberryPiCameras detects available Raspberry Pi cameras using rpicam-vid
+func findRaspberryPiCameras() ([]string, error) {
+	var cameras []string
+
+	// Try to run rpicam-vid with --list-cameras to detect available cameras
+	cmd := exec.Command("rpicam-vid", "--list-cameras")
+	output, err := cmd.Output()
+	if err != nil {
+		// rpicam-vid not available or no cameras found
+		return cameras, err
+	}
+
+	// Parse the output to find camera information
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// Look for lines that contain camera information
+		if strings.Contains(line, ":") && (strings.Contains(strings.ToLower(line), "imx") ||
+			strings.Contains(strings.ToLower(line), "ov") ||
+			strings.Contains(strings.ToLower(line), "camera")) {
+			// Extract camera name from the line
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 {
+				cameraName := strings.TrimSpace(parts[1])
+				if cameraName != "" {
+					cameras = append(cameras, fmt.Sprintf("RPi Camera: %s", cameraName))
+				}
+			}
+		}
+	}
+
+	// If no cameras found through listing, try a simple test
+	if len(cameras) == 0 {
+		// Try to run rpicam-vid briefly to see if any camera is available
+		testCmd := exec.Command("rpicam-vid", "-t", "1", "--nopreview", "-o", "/dev/null")
+		err := testCmd.Run()
+		if err == nil {
+			// Camera available but couldn't get detailed info
+			cameras = append(cameras, "Raspberry Pi Camera")
+		}
+	}
+
 	return cameras, nil
 }
 
@@ -495,7 +554,14 @@ func initAllCameras() {
 	log.Printf("Camera initialization complete: %d active cameras", activeCameras)
 }
 
+// Enhanced initSingleCamera function with Raspberry Pi support
 func initSingleCamera(camera *CameraInstance) error {
+	// Check if this is a Raspberry Pi camera
+	if strings.HasPrefix(camera.Info.Path, "rpicam:") {
+		return initRaspberryPiCamera(camera)
+	}
+
+	// Handle regular V4L2 cameras (existing code)
 	dev, err := device.Open(
 		camera.Info.Path,
 		device.WithIOType(v4l2.IOTypeMMAP),
@@ -536,73 +602,36 @@ func initSingleCamera(camera *CameraInstance) error {
 	return nil
 }
 
-func processFramesForCamera(camera *CameraInstance) {
-	defer close(camera.ProcessedFrameChan)
-	log.Printf("Starting frame processing for camera: %s", camera.Info.Name)
+// initRaspberryPiCamera initializes a Raspberry Pi camera using rpicam-vid
+func initRaspberryPiCamera(camera *CameraInstance) error {
+	// Set default dimensions for RPi camera
+	camera.Width = 640
+	camera.Height = 480
 
-	frameCount := 0
-	lastLogTime := time.Now()
+	camera.Active = true
+	camera.FrameChan = make(chan []byte, 5)
+	camera.ProcessedFrameChan = make(chan *image.RGBA, 2)
 
-	for camera.Active {
-		select {
-		case frameData, ok := <-camera.FrameChan:
-			if !ok {
-				log.Printf("Frame channel closed for camera: %s", camera.Info.Name)
-				return
-			}
+	// Start frame processing goroutine
+	go processFramesForCamera(camera)
 
-			frameCount++
-			now := time.Now()
+	log.Printf("Initialized Raspberry Pi camera: %s (%dx%d)", camera.Info.Name, camera.Width, camera.Height)
 
-			// Log every 5 seconds instead of every 60 frames
-			if now.Sub(lastLogTime) >= 5*time.Second {
-				fps := float64(frameCount) / now.Sub(lastLogTime).Seconds()
-				log.Printf("Camera %s: %d frames, %.1f FPS", camera.Info.Name, frameCount, fps)
-				frameCount = 0
-				lastLogTime = now
-			}
-
-			// Decode JPEG frame
-			img, err := jpeg.Decode(bytes.NewReader(frameData))
-			if err != nil {
-				log.Printf("Failed to decode frame for camera %s: %v", camera.Info.Name, err)
-				continue
-			}
-
-			bounds := img.Bounds()
-			rgbaImg := image.NewRGBA(bounds)
-			draw.Draw(rgbaImg, bounds, img, bounds.Min, draw.Src)
-
-			// Update the current frame for display (use write lock briefly)
-			camera.FrameMutex.Lock()
-			camera.CurrentFrame = rgbaImg
-			camera.LastFrameTime = now
-			camera.FrameMutex.Unlock()
-
-			// Set texture updated flag atomically
-			atomic.StoreInt32(&camera.TextureUpdated, 1)
-
-			select {
-			case camera.ProcessedFrameChan <- rgbaImg:
-			default:
-				// Drop if processing channel is full
-			}
-		case <-time.After(100 * time.Millisecond):
-			// Timeout to prevent blocking if no frames
-			if !camera.Active {
-				return
-			}
-		}
-	}
-
-	log.Printf("Frame processing stopped for camera: %s", camera.Info.Name)
+	return nil
 }
 
+// Enhanced captureFramesForCamera function (for V4L2 cameras only)
 func captureFramesForCamera(camera *CameraInstance) {
 	defer close(camera.FrameChan)
-	log.Printf("Starting frame capture for camera: %s", camera.Info.Name)
 
+	// Skip if this is a Raspberry Pi camera (handled in processFramesForCamera)
+	if strings.HasPrefix(camera.Info.Path, "rpicam:") {
+		return
+	}
+
+	// Handle regular V4L2 cameras
 	for camera.Active {
+		// Read the next frame from the device
 		frame := <-camera.Device.GetOutput()
 		if frame == nil {
 			atomic.AddUint64(&camera.DroppedFrames, 1)
@@ -610,14 +639,14 @@ func captureFramesForCamera(camera *CameraInstance) {
 			continue
 		}
 
+		// Send the frame to our channel
 		select {
 		case camera.FrameChan <- frame:
 		default:
+			// Channel buffer full, drop the frame
 			atomic.AddUint64(&camera.DroppedFrames, 1)
 		}
 	}
-
-	log.Printf("Frame capture stopped for camera: %s", camera.Info.Name)
 }
 
 func cleanupCameras() {
@@ -638,4 +667,60 @@ func cleanupCameras() {
 		camera.FrameMutex.Unlock()
 	}
 	log.Println("Camera cleanup complete")
+}
+
+// Add this function to calculate and update FPS
+func updateCameraFPS(camera *CameraInstance) {
+	camera.FPSMutex.Lock()
+	defer camera.FPSMutex.Unlock()
+
+	now := time.Now()
+	if camera.LastFPSUpdate.IsZero() {
+		camera.LastFPSUpdate = now
+		return
+	}
+
+	duration := now.Sub(camera.LastFPSUpdate)
+	if duration >= time.Second {
+		fps := float64(atomic.LoadUint64(&camera.FrameCount)) / duration.Seconds()
+		atomic.StoreInt32(&camera.FPS, int32(fps))
+		atomic.StoreUint64(&camera.FrameCount, 0)
+		camera.LastFPSUpdate = now
+	}
+}
+
+// Add this function to calculate app rendering FPS
+func updateAppFPS() {
+	cameraApp.AppFPSMutex.Lock()
+	defer cameraApp.AppFPSMutex.Unlock()
+
+	now := time.Now()
+	if cameraApp.AppLastFPSUpdate.IsZero() {
+		cameraApp.AppLastFPSUpdate = now
+		return
+	}
+
+	duration := now.Sub(cameraApp.AppLastFPSUpdate)
+	if duration >= time.Second {
+		fps := float64(atomic.LoadUint64(&cameraApp.AppFrameCount)) / duration.Seconds()
+		atomic.StoreInt32(&cameraApp.AppFPS, int32(fps))
+		atomic.StoreUint64(&cameraApp.AppFrameCount, 0)
+		cameraApp.AppLastFPSUpdate = now
+	}
+}
+
+// Add this to your status bar or info panel
+func renderAppInfo(gtx layout.Context) layout.Dimensions {
+	return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			appFPS := atomic.LoadInt32(&cameraApp.AppFPS)
+			return material.Caption(cameraApp.Theme, fmt.Sprintf("App FPS: %d", appFPS)).Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Spacer{Width: unit.Dp(20)}.Layout(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return material.Caption(cameraApp.Theme, cameraApp.StatusText).Layout(gtx)
+		}),
+	)
 }
