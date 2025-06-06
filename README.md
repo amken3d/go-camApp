@@ -39,7 +39,7 @@ This project provides **6 distinct implementations** of the same camera applicat
 - **Features**: Direct GPU access, minimal overhead
 - **Build**: `go build  -o imgui_opengl`
 
-### 6. **Clay + SDL3** (`imgui_sdl.go`)
+### 6. **Clay + SDL3** (`cd ClayApp`)
 - **Framework**: Clay for layout with SDL3 backend
 - **Description**: SDL3 for window management and rendering. Clay for UI layout management
 - **Features**: Direct GPU access, minimal overhead
